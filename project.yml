@@ -1,0 +1,66 @@
+name: Teleprompter
+options:
+  bundleIdPrefix: com.teleprompter
+  deploymentTarget:
+    macOS: "14.0"
+    iOS: "17.0"
+  xcodeVersion: "16.0"
+  generateEmptyDirectories: true
+  groupSortPosition: top
+
+packages:
+  TeleprompterCore:
+    path: TeleprompterCore
+
+settings:
+  base:
+    SWIFT_STRICT_CONCURRENCY: minimal
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+targets:
+  Teleprompter:
+    type: application
+    platform: macOS
+    sources:
+      - path: Teleprompter
+    dependencies:
+      - package: TeleprompterCore
+    settings:
+      base:
+        PRODUCT_NAME: Teleprompter
+        PRODUCT_BUNDLE_IDENTIFIER: com.teleprompter.app
+        INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.video"
+        INFOPLIST_KEY_CFBundleDisplayName: "Teleprompter"
+        INFOPLIST_KEY_NSMainNibFile: ""
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: YES
+        COMBINE_HIDPI_IMAGES: YES
+    info:
+      path: Teleprompter/Resources/Info.plist
+      properties:
+        CFBundleDevelopmentRegion: en
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
+        CFBundleName: $(PRODUCT_NAME)
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: 1.0.0
+        CFBundleVersion: 1
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        NSMicrophoneUsageDescription: "Teleprompter uses the microphone for speech tracking."
+        NSCameraUsageDescription: "Teleprompter uses the camera for recording."
+        NSSpeechRecognitionUsageDescription: "Teleprompter uses on-device speech recognition to track your position in the script."
+        NSHighResolutionCapable: true
+
+  TeleprompterTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: TeleprompterTests
+    dependencies:
+      - target: Teleprompter
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.teleprompter.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Teleprompter.app/Contents/MacOS/Teleprompter
+        BUNDLE_LOADER: $(TEST_HOST)
