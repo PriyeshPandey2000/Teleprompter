@@ -13,14 +13,32 @@ public enum TrackingStatus: Sendable, Equatable {
     case recovering
     case manual
     case degraded(reason: DegradedReason)
+    /// Sticky terminal state: automatic recovery gave up after repeated
+    /// failed attempts. Only an explicit manual jump exits this state.
+    case manualFallback
 
     public var isHealthy: Bool {
         switch self {
         case .tracking, .paused, .manual:
             return true
-        case .uncertain, .recovering, .degraded:
+        case .uncertain, .recovering, .degraded, .manualFallback:
             return false
         }
+    }
+
+    public var isDegraded: Bool {
+        if case .degraded = self { return true }
+        return false
+    }
+
+    public var isRecovering: Bool {
+        if case .recovering = self { return true }
+        return false
+    }
+
+    public var isManualFallback: Bool {
+        if case .manualFallback = self { return true }
+        return false
     }
 
     public var indicatorColor: String {
@@ -29,7 +47,7 @@ public enum TrackingStatus: Sendable, Equatable {
         case .paused: return "gray"
         case .manual: return "blue"
         case .uncertain, .recovering: return "yellow"
-        case .degraded: return "red"
+        case .degraded, .manualFallback: return "red"
         }
     }
 }

@@ -36,7 +36,8 @@ public actor ScriptFormatter {
             blocks: blocks,
             plainText: plainText,
             wordCount: wordCount,
-            estimatedDuration: estimatedDuration
+            estimatedDuration: estimatedDuration,
+            tokens: ScriptTokens.make(from: blocks)
         )
     }
 

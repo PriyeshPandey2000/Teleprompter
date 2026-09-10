@@ -31,6 +31,28 @@ struct TeleprompterView: View {
                 RecordingBadge()
             }
         }
+        .overlay(alignment: .bottom) {
+            if appState.trackingStatus.isRecovering {
+                TrackingStatusBanner(
+                    label: "Resyncing…",
+                    color: .yellow
+                )
+            } else if appState.trackingStatus.isManualFallback {
+                TrackingStatusBanner(
+                    label: "Tracking paused — tap where you are in the script",
+                    color: .red
+                )
+            } else if appState.trackingStatus.isDegraded {
+                TrackingStatusBanner(
+                    label: "Tracking lost — tap to re-sync",
+                    color: .red
+                ) {
+                    Task {
+                        await appState.jumpTo(position: appState.trackingPosition)
+                    }
+                }
+            }
+        }
         .onKeyDown { event in
             handleKeyPress(event)
         }
@@ -63,21 +85,25 @@ struct TeleprompterView: View {
         }
     }
 
+    /// Opacity for text that's behind the reader's current position — dimmed
+    /// but still legible, never fully hidden.
+    private let dimOpacity: Double = 0.6
+
     @ViewBuilder
     private func blockView(_ block: ScriptBlock, at index: Int) -> some View {
         let isCurrentBlock = index == appState.trackingPosition.blockIndex
+        // Only the block being actively read gets word-level tracking; the
+        // matcher's wordIndex is meaningless for any other block.
+        let spokenThrough = isCurrentBlock ? appState.trackingPosition.wordIndex : nil
 
         Group {
             switch block {
             case .heading(_, let text):
-                Text(text)
-                    .font(.system(size: fontSize + 6, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
+                wordFlow(text, spokenThrough: spokenThrough, fontSize: fontSize + 6, weight: .bold, design: .rounded)
 
             case .paragraph(_, let text):
-                Text(text)
-                    .font(.system(size: fontSize, weight: .regular, design: .serif))
-                    .foregroundStyle(.white.opacity(isCurrentBlock ? 1.0 : 0.6))
+                wordFlow(text, spokenThrough: spokenThrough, fontSize: fontSize)
+                    .opacity(isCurrentBlock ? 1.0 : dimOpacity)
                     .lineSpacing(12)
 
             case .bullet(_, let text):
@@ -86,9 +112,8 @@ struct TeleprompterView: View {
                         .fill(.white.opacity(0.5))
                         .frame(width: 8, height: 8)
                         .offset(y: 10)
-                    Text(text)
-                        .font(.system(size: fontSize, weight: .regular, design: .serif))
-                        .foregroundStyle(.white.opacity(isCurrentBlock ? 1.0 : 0.6))
+                    wordFlow(text, spokenThrough: spokenThrough, fontSize: fontSize)
+                        .opacity(isCurrentBlock ? 1.0 : dimOpacity)
                         .lineSpacing(12)
                 }
 
@@ -97,19 +122,74 @@ struct TeleprompterView: View {
                     Text("\(number).")
                         .font(.system(size: fontSize, weight: .bold, design: .rounded))
                         .foregroundStyle(.white.opacity(0.5))
-                    Text(text)
-                        .font(.system(size: fontSize, weight: .regular, design: .serif))
-                        .foregroundStyle(.white.opacity(isCurrentBlock ? 1.0 : 0.6))
+                    // `text` excludes the "N." prefix, but the matcher
+                    // tokenized `plainText` (prefix included), so wordIndex
+                    // needs the prefix's own token count subtracted back out
+                    // before it lines up with `text`'s word positions.
+                    wordFlow(text, spokenThrough: numberedItemSpokenThrough(spokenThrough, number: number), fontSize: fontSize)
+                        .opacity(isCurrentBlock ? 1.0 : dimOpacity)
                         .lineSpacing(12)
                 }
             }
         }
+        .animation(.easeInOut(duration: 0.12), value: appState.trackingPosition)
         .onTapGesture {
             Task {
                 let position = TrackingPosition(blockIndex: index, wordIndex: 0, confidence: 1.0)
                 await appState.jumpTo(position: position)
             }
         }
+    }
+
+    private func numberedItemSpokenThrough(_ spokenThrough: Int?, number: Int) -> Int? {
+        guard let spokenThrough else { return nil }
+        let prefixTokenCount = ScriptTokens.rawWords(in: "\(number).").count
+        return spokenThrough - prefixTokenCount
+    }
+
+    /// Renders `text` as one naturally-wrapping `Text`, one styled run per
+    /// word. A growing highlight starts at the first word and stays at full
+    /// opacity through every word up to and including `spokenThrough` (the
+    /// matcher's word index within this block — the most recently confirmed
+    /// word); words beyond that, not yet spoken, dim. `spokenThrough == nil`
+    /// means this block isn't the one being read — every word renders at
+    /// full opacity here, and the caller dims the whole block uniformly
+    /// instead (so the dim isn't applied twice).
+    ///
+    /// Word boundaries come from `ScriptTokens.rawWords`, the same rule the
+    /// matcher tokenizes on, so a word here is only ever marked spoken once
+    /// the matcher has actually confirmed it — never based on the block
+    /// flipping "current" as a whole.
+    private func wordFlow(
+        _ text: String,
+        spokenThrough: Int?,
+        fontSize: Double,
+        weight: Font.Weight = .regular,
+        design: Font.Design = .serif
+    ) -> Text {
+        let words = text.split(whereSeparator: \.isWhitespace)
+        guard !words.isEmpty else { return Text(text) }
+
+        var result: Text?
+        var consumedTokens = 0
+
+        for word in words {
+            consumedTokens += ScriptTokens.rawWords(in: String(word)).count
+            let opacity: Double
+            if let spokenThrough {
+                opacity = consumedTokens <= spokenThrough + 1 ? 1.0 : dimOpacity
+            } else {
+                opacity = 1.0
+            }
+
+            let segment = Text(word)
+                .font(.system(size: fontSize, weight: weight, design: design))
+                .foregroundStyle(.white.opacity(opacity))
+
+            result = result.map { $0 + Text(" ") + segment } ?? segment
+        }
+
+        return result ?? Text(text)
     }
 
     // MARK: - Tracking Indicator
@@ -131,7 +211,7 @@ struct TeleprompterView: View {
         case .paused: return .gray
         case .manual: return .blue
         case .uncertain, .recovering: return .yellow
-        case .degraded: return .red
+        case .degraded, .manualFallback: return .red
         }
     }
 
@@ -198,5 +278,42 @@ struct RecordingBadge: View {
         .padding(.vertical, 6)
         .background(.black.opacity(0.6), in: Capsule())
         .padding(16)
+    }
+}
+
+// MARK: - Tracking Status Banner
+
+struct TrackingStatusBanner: View {
+    let label: String
+    let color: Color
+    var action: (() -> Void)?
+
+    var body: some View {
+        Group {
+            if let action {
+                Button(action: action) {
+                    content
+                }
+                .buttonStyle(.plain)
+            } else {
+                content
+            }
+        }
+        .padding(.bottom, 24)
+    }
+
+    private var content: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.black.opacity(0.7), in: Capsule())
+        .contentShape(Capsule())
     }
 }

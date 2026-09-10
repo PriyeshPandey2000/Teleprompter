@@ -8,6 +8,7 @@ import TeleprompterCore
 final class MockSpeechRecognizer: SpeechRecognizerProtocol {
     var state: ASRState = .idle
     var onResult: ((ASRResult) -> Void)?
+    var onStateChange: ((ASRState) -> Void)?
     var permissionGranted = true
     var startShouldFail = false
     var resultToEmit: ASRResult?
@@ -109,6 +110,46 @@ struct AppStateTests {
 
         await appState.beginRecording(withCountdown: 1)
         #expect(appState.isRecording == true)
+    }
+
+    @Test("A start-point tap before recording sticks, and doesn't show as tracking yet")
+    func startPointSelectionSticks() async {
+        let mock = MockSpeechRecognizer()
+        let appState = AppState(recognizer: mock)
+        await appState.loadScript(rawText: "First paragraph here.\n\nSecond paragraph here.\n\nThird paragraph here.")
+
+        let anchor = TrackingPosition(blockIndex: 2, wordIndex: 0)
+        await appState.jumpTo(position: anchor)
+
+        #expect(appState.trackingPosition.blockIndex == 2)
+        #expect(appState.trackingStatus == .paused, "a pre-recording tap shouldn't show as actively tracking")
+
+        await appState.startRecording()
+
+        #expect(appState.isRecording == true)
+        #expect(appState.trackingStatus == .tracking)
+        #expect(appState.trackingPosition.blockIndex == 2, "recording should start from the tapped anchor, not block 0")
+    }
+
+    @Test("Recording sessions are captured in telemetry")
+    func telemetryCapturesSession() async throws {
+        let mock = MockSpeechRecognizer()
+        let appState = AppState(recognizer: mock)
+        await appState.loadScript(rawText: "First paragraph here.\n\nSecond paragraph here.")
+
+        await appState.startRecording()
+        mock.onResult?(ASRResult(transcript: "First paragraph here", isFinal: false, confidence: 0.9))
+        try await Task.sleep(for: .milliseconds(100))
+        await appState.stopRecording()
+
+        let scriptID = try #require(appState.currentScript?.id)
+        let sessions = await appState.telemetry.getSessions(for: scriptID)
+        let session = try #require(sessions.first)
+
+        #expect(sessions.count == 1)
+        #expect(session.takeNumber == 1)
+        #expect(session.endTime != nil)
+        #expect(!session.events.isEmpty, "position/status events from the take should be recorded")
     }
 }
 
