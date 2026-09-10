@@ -87,7 +87,15 @@ public actor PositionEngine {
             velocityEstimator.update(deltaTokens: consumed, elapsed: elapsed)
         }
         lastCursor = newSnapshot.cursor
-        lastFeedAt = at
+        // Feed timestamps are ASR event times, not processing times, so a
+        // queued result can carry an older timestamp than the one before it.
+        // Keep the stored timestamp monotonic: (a) a backwards assignment is
+        // a no-op for the estimator (elapsed would be negative) and (b) it
+        // would otherwise inflate the NEXT sample's elapsed interval and
+        // underestimate the reading speed.
+        if lastFeedAt == nil || at >= lastFeedAt! {
+            lastFeedAt = at
+        }
 
         switch result.kind {
         case .near, .reanchor:

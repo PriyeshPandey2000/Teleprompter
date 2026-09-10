@@ -1175,11 +1175,17 @@ struct VelocityInMatchPipelineTests {
         let engine = TrackingEngine(clock: { clock.now })
         await engine.configure(script: await tokens())
         await engine.start()
+        // Explicit ASR arrival timestamps: the engine clock (backlog, envelope)
+        // and the speech pace are independent inputs post-fix.
         clock.set(0)
-        await engine.processASRResult(ASRResult(transcript: "We need to make sales"))
-        clock.set(2.0)
         await engine.processASRResult(ASRResult(
-            transcript: "We need to make sales now and grow the business"
+            transcript: "We need to make sales",
+            timestamp: Date(timeIntervalSince1970: 1.0)
+        ))
+        clock.set(3.0)
+        await engine.processASRResult(ASRResult(
+            transcript: "We need to make sales now and grow the business",
+            timestamp: Date(timeIntervalSince1970: 3.0)
         ))
 
         var state = await engine.getCurrentState()
@@ -1190,5 +1196,62 @@ struct VelocityInMatchPipelineTests {
         await engine.jumpTo(position: TrackingPosition(blockIndex: 1, wordIndex: 0))
         state = await engine.getCurrentState()
         #expect(state.position.velocity == 0, "a manual jump must snap, not glide at the old pace")
+    }
+
+    @Test("Velocity follows ASR arrival times, not the processing clock")
+    func velocityUsesArrivalTime() async {
+        let clock = TestClock(date: Date(timeIntervalSince1970: 0))
+        let engine = TrackingEngine(clock: { clock.now })
+        await engine.configure(script: await tokens())
+        await engine.start()
+
+        // Words spoken 2s apart, but both processed at the same wall-clock
+        // instant (heavy queue backlog). If velocity sampled the processing
+        // clock the elapsed interval would be ~0 and reading pace would never
+        // register; it must track the ASR timestamps instead.
+        clock.set(50.0)
+        await engine.processASRResult(ASRResult(
+            transcript: "We need to make sales",
+            timestamp: Date(timeIntervalSince1970: 1.0)
+        ))
+        await engine.processASRResult(ASRResult(
+            transcript: "We need to make sales now and grow the business",
+            timestamp: Date(timeIntervalSince1970: 3.0)
+        ))
+
+        let state = await engine.getCurrentState()
+        #expect(state.status == .tracking)
+        #expect(state.position.velocity > 0)
+    }
+
+    @Test("A late out-of-order result does not rewind the velocity clock")
+    func outOfOrderArrivalKeepsClockMonotonic() async {
+        let clock = TestClock(date: Date(timeIntervalSince1970: 0))
+        let engine = TrackingEngine(clock: { clock.now })
+        await engine.configure(script: await tokens())
+        await engine.start()
+        clock.set(10.0)
+
+        await engine.processASRResult(ASRResult(
+            transcript: "We need to make sales",
+            timestamp: Date(timeIntervalSince1970: 5.0)
+        ))
+        await engine.processASRResult(ASRResult(
+            transcript: "We need to make sales now and grow the business",
+            timestamp: Date(timeIntervalSince1970: 4.0) // arrives later, older timestamp
+        ))
+
+        let state = await engine.getCurrentState()
+        // The older timestamp must not reset lastFeedAt (monotonic guard), so
+        // the next sample still measures against 5.0, not 4.0. Re-feed at 7.0
+        // and require a healthy pace.
+        clock.set(11.0)
+        await engine.processASRResult(ASRResult(
+            transcript: "We need to make sales now and grow the business Next we will hire more people and expand into new cities",
+            timestamp: Date(timeIntervalSince1970: 7.0)
+        ))
+        let after = await engine.getCurrentState()
+        #expect(after.status == .tracking)
+        #expect(after.position.velocity > 0, "velocity must not be depressed by a backwards-arriving result")
     }
 }

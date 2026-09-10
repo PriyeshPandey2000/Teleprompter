@@ -68,12 +68,17 @@ enum ScriptImporter {
         process.standardError = FileHandle.nullDevice
         do {
             try process.run()
+            // Drain the pipe BEFORE waiting for exit. unzip writes into a
+            // finite pipe buffer; if a large document.xml fills it, unzip
+            // blocks writing until someone reads, and waitUntilExit() would
+            // deadlock the import forever (no text, no error alert).
+            let data = output.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            return textFromDocumentXML(data: data)
         } catch {
             return nil
         }
-        guard process.terminationStatus == 0 else { return nil }
-        return textFromDocumentXML(data: output.fileHandleForReading.readDataToEndOfFile())
     }
 
     /// Extracts the visible text from a DOCX `document.xml` payload.

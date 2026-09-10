@@ -114,7 +114,13 @@ public actor TrackingEngine {
         if let latencyCycle {
             await latencyRecorder.mark(.matcherStarted, forCycle: latencyCycle)
         }
-        let outcome = await positionEngine.feed(transcript: result.transcript, at: clock())
+        // Velocity samples use the result's ASR arrival timestamp, not
+        // `clock()`. A queued result can sit behind earlier matcher work and
+        // awaited callbacks; sampling the processing time would inflate the
+        // elapsed interval and under-report how fast the reader is speaking.
+        // The envelope (lastConfirmedAt, degrade escalation) still uses
+        // `clock()`, which measures processing time correctly for that job.
+        let outcome = await positionEngine.feed(transcript: result.transcript, at: result.timestamp)
         if let latencyCycle {
             await latencyRecorder.mark(.matcherFinished, forCycle: latencyCycle)
         }
