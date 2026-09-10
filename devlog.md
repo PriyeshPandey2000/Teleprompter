@@ -4,6 +4,46 @@ Running log of implementation progress and the reasoning behind non-obvious deci
 
 ---
 
+## 2026-09-10 — Velocity/scroll smoothing: the viewport glides at the reader's measured pace
+
+Step past the last extension of the "how should the screen get there?" half of the tracking pipeline (next item in the agreed order in the escalation entry below). Before this, every position update recentered the block with a fixed 0.15s ease — the scroll never moved at reading speed, and a far skip looked like a teleport.
+
+### The frame (from PRD §31)
+
+> "Given the last 10 seconds of movement, line 472 is probably the current position."
+
+Instead of "the latest ASR phrase matched line 472, jump there," the engine now maintains a *velocity* state (words/sec) and the scroll layer converts a target + velocity into a glide duration. This keeps the two halves separate: the matcher says *where the user is*, velocity/scroll timing says *how the screen should get there*.
+
+### What shipped (TeleprompterCore)
+
+- **`ReadingVelocityEstimator`** — smooths (token delta, elapsed) samples into words/sec with an exponential EWMA (τ = 5s, clamp 10 wps). Pauses decay it to zero, so a silence never leaves a stale "keep gliding" pace lingering; `reset()` drops it to zero, so a manual jump snaps instead of gliding at the old pace.
+- **`PositionEngine.feed(transcript:at:)`** — now takes a timestamp (`TrackingEngine` passes its existing injectable clock), refreshes the estimator on every feed (matched words credit the advance; holds/rebases only decay), and fills `TrackingPosition.velocity` — a field that existed since the V0 but was never set anywhere.
+- **`ScrollTiming`** — pure timing math: `travelDuration(words:velocity:)`. Faster reader → faster glide (∝ 1/velocity), bounded to [0.25, 1.5]s, and moves beyond ~80 words scale proportionally so a far skip still sweeps coherently instead of teleporting. Zero/unknown velocity → 0.2s snap.
+
+### What shipped (app)
+
+`TeleprompterView.scrollTo(block:from:using:)` now measures the word distance between the old and new block start in the matcher's flat token space (`formattedScript.tokens.tokenIndex`) and animates with `.easeOut(duration: travelDuration(...))` instead of the hard-coded `.easeInOut(duration: 0.15)`.
+
+Same injectable clock, same pure math — nothing heuristic or wall-time-raced in the app layer, so it's deterministic under the existing TestClock-driven engine tests.
+
+### Design notes
+
+- Kept `.center` anchor + block granularity. True continuous word-pixel panning (a fixed reading line with text rolling up into it) is the natural next increment and would consume `velocity` directly as the pixel-rate — see roadmap.
+- Velocity is a **display-pacing** signal, never a **match-deciding** signal — the matcher ignores it, so it can't bias where the reader is.
+
+### Also in this PR (supporting fixes from the same pass)
+
+- **Font size** (PRD §8): smart auto default (`AppState.ensureSmartDefaults()` — NSScreen heuristic, `min(w,h)×0.045`, clamp 20–72 step 2, one-time) plus Cmd+= / Cmd+- (font ±2) / Cmd+0 (reset); advertised under Shortcuts → Appearance.
+- **Shortcut truth**: removed the fake Cmd+Enter/Esc from the advertised set; added Shift+↑/↓ = ±5-block large adjustment (clamped).
+- **Document import** (`ScriptImporter`): TXT (BOM-aware UTF-8/16 + Latin-1 fallback), PDF (PDFKit), DOCX (`/usr/bin/unzip -p` + XMLParser with `localName` normalization — Foundation reports namespaced `w:t`, not bare `t`; skips `w:instrText`); docx added to the open panel with an alert on unreadable files.
+- **`project.yml`** now declares the `Teleprompter` scheme (build `Teleprompter`, test `TeleprompterTests`) so `xcodegen generate` reproduces a workable scheme instead of silently dropping it.
+
+### Verified
+
+TeleprompterCore: 67 tests / 14 suites green; app: 17 tests / 3 suites green, build succeeds. New tests cover the estimator (convergence on a sustained rate, faster-vs-slower, burst clamp, pause decay, zero-elapsed no-op, reset), scroll timing (bounds, monotonicity, no-velocity snap, far-skip sweep), and velocity through the match pipeline (a fresh session doesn't invent velocity; engine reports velocity > 0 while reading and exactly 0 right after a manual jump).
+
+---
+
 ## 2026-09-10 (evening) — CodeRabbit review on PR #1: all 6 findings real, fixed
 
 Traced each flagged line against the actual code before touching anything — verdict: no false positives, one genuine concurrency bug underlying three of the six comments.
@@ -244,10 +284,10 @@ resume", red).
 
 - Haven't eyeballed the actual banner/flow in the running app yet (Hyperframes
   preview or manual run) — next step.
-- Velocity/scroll smoothing — after the above.
+- Velocity/scroll smoothing — done (see the velocity entry at the top).
 - Semantic matching — explicitly deferred; the lexical matcher is already
   sophisticated enough that its real-world behavior should be observed before
-  adding another layer.
+  adding another layer. Next after velocity: word-pixel panning.
 
 ---
 

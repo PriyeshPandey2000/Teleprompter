@@ -1,15 +1,22 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import TeleprompterCore
 
 struct ScriptEditorView: View {
     @Environment(AppState.self) private var appState
     @State private var scriptText = ""
+    @State private var showImportError = false
 
     var body: some View {
         VStack(spacing: 0) {
             headerBar
             Divider()
             editorArea
+        }
+        .alert("Couldn't read file", isPresented: $showImportError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("No readable text was found in that file. Try plain text, a text-based PDF, or a DOCX.")
         }
     }
 
@@ -79,7 +86,11 @@ struct ScriptEditorView: View {
     private func importFile() {
         #if os(macOS)
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.plainText, .pdf]
+        var contentTypes: [UTType] = [.plainText, .pdf]
+        if let docx = UTType(filenameExtension: "docx") {
+            contentTypes.append(docx)
+        }
+        panel.allowedContentTypes = contentTypes
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
 
@@ -93,8 +104,10 @@ struct ScriptEditorView: View {
     }
 
     private func importFile(at url: URL) async {
-        guard let data = try? Data(contentsOf: url),
-              let text = String(data: data, encoding: .utf8) else { return }
+        guard let text = ScriptImporter.text(at: url) else {
+            showImportError = true
+            return
+        }
         scriptText = text
     }
 }

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import TeleprompterCore
 
 @main
@@ -38,6 +39,26 @@ final class AppState: @unchecked Sendable {
 
     init(recognizer: SpeechRecognizerProtocol? = nil) {
         self.recognizer = recognizer ?? SFSpeechRecognizerService()
+        ensureSmartDefaults()
+    }
+
+    /// PRD §8: on first launch, size the typography to the display instead of a
+    /// hardcoded default. Runs only when the user hasn't already set a size
+    /// (i.e. the `fontSize` key has never been written), so their override —
+    /// via the slider or Cmd shortcuts — is always respected.
+    static let fontSizeKey = "fontSize"
+
+    private func ensureSmartDefaults() {
+        guard UserDefaults.standard.object(forKey: Self.fontSizeKey) == nil else { return }
+        UserDefaults.standard.set(Self.autoFontSize(), forKey: Self.fontSizeKey)
+    }
+
+    /// Font size heuristic: a comfortable word height for the primary display.
+    static func autoFontSize() -> Double {
+        guard let screen = NSScreen.main?.visibleFrame else { return 36 }
+        let base = min(screen.width, screen.height)
+        let stepped = ((base * 0.045) / 2).rounded() * 2
+        return min(72, max(20, stepped))
     }
 
     func loadScript(rawText: String) async {
