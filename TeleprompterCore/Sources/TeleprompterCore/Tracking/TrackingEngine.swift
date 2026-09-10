@@ -30,14 +30,22 @@ public actor TrackingEngine {
     private let clock: @Sendable () -> Date
     private let envelope: TrackingEnvelopeConfig
 
-    public var onStatusChange: (@Sendable (TrackingStatus) -> Void)?
-    public var onPositionUpdate: (@Sendable (TrackingPosition) -> Void)?
+    // These are `async` — not just `@Sendable` — deliberately. A caller that
+    // needs to hop to another actor (e.g. AppState hopping to @MainActor to
+    // apply a position update) can now `await` that hop directly inside the
+    // callback, instead of spawning a detached `Task` that races everything
+    // else. `notifyStatusChange`/`notifyPositionUpdate`/`notifyEvent` below
+    // `await` these, so `jumpTo`/`start`/etc. don't return until the
+    // callback's own work has actually finished — no more "did the UI
+    // actually apply this yet?" ambiguity for callers.
+    public var onStatusChange: (@Sendable (TrackingStatus) async -> Void)?
+    public var onPositionUpdate: (@Sendable (TrackingPosition) async -> Void)?
     /// Fires for every telemetry-worthy event: manual corrections, pause/
     /// resume, degrade/recover transitions, and skip/backtrack re-anchors.
     /// This is the only way for a caller (e.g. `RecordingTelemetry`) to see
     /// individual events — `history` below is a private, capped ring buffer
     /// for the engine's own bookkeeping only.
-    public var onEvent: (@Sendable (TrackingEvent) -> Void)?
+    public var onEvent: (@Sendable (TrackingEvent) async -> Void)?
 
     public init(
         positionEngine: PositionEngine = PositionEngine(),
@@ -98,6 +106,10 @@ public actor TrackingEngine {
         // Sticky: automatic recovery has given up. Freeze until the user taps
         // a position — no auto re-anchor, no position movement, no status flip.
         guard status != .manualFallback else { return }
+        // A result that was already in flight when `pause()` ran (e.g. the
+        // caller stopped recording mid-ASR-callback) must not silently
+        // revive tracking — `pause()` is meant to be a hard stop.
+        guard status != .paused else { return }
 
         if let latencyCycle {
             await latencyRecorder.mark(.matcherStarted, forCycle: latencyCycle)
@@ -158,9 +170,28 @@ public actor TrackingEngine {
 
     public func adjustPosition(delta: Int) async {
         var newPos = position
-        newPos.blockIndex = max(0, newPos.blockIndex + delta)
+        newPos.blockIndex = newPos.blockIndex + delta
         newPos.confidence = 1.0
-        await jumpTo(position: newPos)
+        await jumpTo(position: clampedPosition(newPos))
+    }
+
+    /// Clamps `position` to the last block/word the current script actually
+    /// has. Without this, repeated forward `adjustPosition` calls can walk
+    /// `blockIndex` past the script's end — `resetMatcher` would then find no
+    /// matching token, silently fall back to token 0, and leave the engine
+    /// (and the UI, via the stored `TrackingPosition`) pointing at a block
+    /// that doesn't exist while the matcher cursor is actually back at the
+    /// start of the script.
+    private func clampedPosition(_ position: TrackingPosition) -> TrackingPosition {
+        guard let scriptTokens, scriptTokens.count > 0 else { return position }
+        let lastBlock = scriptTokens.blockStart.count - 2
+        guard lastBlock >= 0 else { return position }
+
+        var clamped = position
+        clamped.blockIndex = min(max(0, clamped.blockIndex), lastBlock)
+        let blockWordCount = scriptTokens.blockStart[clamped.blockIndex + 1] - scriptTokens.blockStart[clamped.blockIndex]
+        clamped.wordIndex = min(max(0, clamped.wordIndex), max(0, blockWordCount - 1))
+        return clamped
     }
 
     public func recenter() async {
@@ -172,9 +203,9 @@ public actor TrackingEngine {
     }
 
     public func setCallbacks(
-        onStatusChange: (@Sendable (TrackingStatus) -> Void)?,
-        onPositionUpdate: (@Sendable (TrackingPosition) -> Void)?,
-        onEvent: (@Sendable (TrackingEvent) -> Void)? = nil
+        onStatusChange: (@Sendable (TrackingStatus) async -> Void)?,
+        onPositionUpdate: (@Sendable (TrackingPosition) async -> Void)?,
+        onEvent: (@Sendable (TrackingEvent) async -> Void)? = nil
     ) {
         self.onStatusChange = onStatusChange
         self.onPositionUpdate = onPositionUpdate
@@ -284,14 +315,14 @@ public actor TrackingEngine {
     }
 
     private func notifyStatusChange(_ newStatus: TrackingStatus) async {
-        onStatusChange?(newStatus)
+        await onStatusChange?(newStatus)
     }
 
     private func notifyPositionUpdate(_ newPosition: TrackingPosition) async {
-        onPositionUpdate?(newPosition)
+        await onPositionUpdate?(newPosition)
     }
 
     private func notifyEvent(_ event: TrackingEvent) async {
-        onEvent?(event)
+        await onEvent?(event)
     }
 }

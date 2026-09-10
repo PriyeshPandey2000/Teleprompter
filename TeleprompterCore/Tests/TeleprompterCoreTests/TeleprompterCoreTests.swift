@@ -617,6 +617,50 @@ struct TrackingEnvelopeTests {
         state = await engine.getCurrentState()
         #expect(state.status == .degraded(reason: .asrUnreliable))
     }
+
+    @Test("A result that arrives after pause() does not revive tracking")
+    func pausedIgnoresLateASRResult() async {
+        let engine = TrackingEngine(clock: { .now })
+        await engine.configure(script: await tokens())
+        await engine.start()
+        await engine.processASRResult(ASRResult(transcript: "We need to make sales"))
+        var state = await engine.getCurrentState()
+        #expect(state.status == .tracking)
+        let confirmedPosition = state.position
+
+        await engine.pause()
+        state = await engine.getCurrentState()
+        #expect(state.status == .paused)
+
+        // Simulates a result that was already in flight when `pause()` ran
+        // (e.g. `stopRecording` racing an in-progress ASR callback) — it
+        // must not silently flip status back to `.tracking` or move position.
+        await engine.processASRResult(ASRResult(
+            transcript: "We need to make sales now and grow the business"
+        ))
+        state = await engine.getCurrentState()
+        #expect(state.status == .paused)
+        #expect(state.position == confirmedPosition)
+    }
+
+    @Test("adjustPosition clamps to the script's actual last block, not just zero")
+    func adjustPositionClampsUpperBound() async {
+        let engine = TrackingEngine(clock: { .now })
+        await engine.configure(script: await tokens())
+        await engine.start()
+
+        // sampleScript has 4 blocks (indices 0...3); walking forward far
+        // past the end must clamp to the last block, not silently leave the
+        // matcher reset to token 0 while the stored position claims a block
+        // the script doesn't have.
+        await engine.adjustPosition(delta: 100)
+        var state = await engine.getCurrentState()
+        #expect(state.position.blockIndex == 3)
+
+        await engine.adjustPosition(delta: -100)
+        state = await engine.getCurrentState()
+        #expect(state.position.blockIndex == 0)
+    }
 }
 
 @Suite("Recovery Escalation")

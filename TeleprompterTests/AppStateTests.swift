@@ -167,4 +167,19 @@ struct ScriptLoadingTests {
         #expect(appState.formattedScript != nil)
         #expect(appState.formattedScript?.blocks.count == 2)
     }
+
+    @Test("Loading a new script resets stale tracking position and status")
+    func loadScriptResetsStaleTracking() async {
+        let appState = AppState(recognizer: MockSpeechRecognizer())
+        await appState.loadScript(rawText: "First paragraph here.\n\nSecond paragraph here.\n\nThird paragraph here.")
+        await appState.jumpTo(position: TrackingPosition(blockIndex: 2, wordIndex: 0))
+        #expect(appState.trackingPosition.blockIndex == 2)
+
+        // A shorter replacement script: block 2 wouldn't even exist in it.
+        // Nothing here should carry over from the previous script.
+        await appState.loadScript(rawText: "Only one paragraph now.")
+
+        #expect(appState.trackingPosition == TrackingPosition())
+        #expect(appState.trackingStatus == .paused)
+    }
 }

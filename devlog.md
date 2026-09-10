@@ -4,6 +4,40 @@ Running log of implementation progress and the reasoning behind non-obvious deci
 
 ---
 
+## 2026-09-10 (evening) — CodeRabbit review on PR #1: all 6 findings real, fixed
+
+Traced each flagged line against the actual code before touching anything — verdict: no false positives, one genuine concurrency bug underlying three of the six comments.
+
+### The core bug: `onResult` spawned an untracked `Task` per ASR callback
+
+`recognizer.onResult` wrapped every call in its own `Task { ... }`. Since ASR partials can arrive faster than one full asr → matcher → position → UI round trip completes, and unstructured `Task`s have no ordering guarantee relative to each other, this had three real consequences:
+
+- **Out-of-order processing** (comment 2): if two results raced and the *newer* one got processed by `TrackingEngine`'s actor before the *older* one, the older (shorter) transcript would look like a legitimate ASR revision and trigger `ScriptMatcher`'s rebase path — rewinding `consumedSpokenCount` and corrupting the matcher's progress.
+- **Latency-cycle corruption** (comment 4, folded in): `LatencyRecorder.beginCycle()` discards the previous *incomplete* cycle — so a second racing Task's `beginCycle()` could silently drop the first Task's marks, and `completePendingCycle()` (which doesn't take a cycle ID) could finalize the wrong Task's cycle entirely.
+- **Stale work outliving `stopRecording()`** (comment 3): nothing tracked or cancelled these Tasks, so one already in flight when the user hit stop could still land afterward and flip status/position or write telemetry into a session that was about to close.
+
+**Fix:** replaced the per-call `Task` with a single serial consumer — `onResult` now just does a synchronous, ordered `AsyncStream.Continuation.yield(_:)` (enqueue only, no race possible), and one long-lived consumer `Task` processes results strictly FIFO. `stopRecording()` now finishes the stream, cancels the consumer, and `await`s its `.value` — guaranteeing no `processASRResult` call can still be in flight before `trackingEngine.pause()` runs. Added a defense-in-depth guard in `TrackingEngine.processASRResult` itself (`guard status != .paused else { return }`, mirroring the existing `.manualFallback` guard) so even a result that somehow slips through can't revive a stopped engine.
+
+### The `applyStatus`/`applyPosition` race (comment 6)
+
+`TrackingEngine`'s `onStatusChange`/`onPositionUpdate`/`onEvent` closures were plain `@Sendable (T) -> Void` — synchronous by type. `AppState`'s implementations had to spawn `Task { @MainActor in ... }` internally just to reach MainActor-isolated state, and returned immediately without waiting for that spawned Task — so `await trackingEngine.jumpTo(...)` could return before `trackingPosition`/`trackingStatus` were actually assigned. A test asserting the position immediately after a `jumpTo` call was technically racing, even though it happened to pass reliably in practice.
+
+**Fix:** changed the callback types to `async` (`@Sendable (T) async -> Void`) and had `notifyStatusChange`/`notifyPositionUpdate`/`notifyEvent` `await` them. `AppState`'s closures now call `await self?.applyStatus(status)` directly instead of spawning a detached Task — so the whole chain (`jumpTo` → `notifyPositionUpdate` → callback → MainActor mutation) is one awaited sequence with no gap. This is why the fix for #4 above was "free": once `onPositionUpdate` is properly awaited through to the MainActor mutation actually happening, `processASRResult` returning means the UI update already landed — no separate cycle-completion restructuring needed.
+
+Backward compatible for every existing test: a synchronous closure literal implicitly widens to an `async` function type in Swift, so none of the `TeleprompterCoreTests` callback-registration call sites needed changes.
+
+### The other three (independent, narrower)
+
+- **Comment 1** — `loadScript` never reset `trackingPosition`/`trackingStatus`. A stale position from a previous (possibly longer) script could carry into the next `startRecording` via its `position ?? trackingPosition` fallback, even if that block index doesn't exist in the new script. Fixed by resetting both at the top of `loadScript`.
+- **Comment 5** — `adjustPosition` only clamped the *lower* bound (`max(0, ...)`). Walking forward past the script's last block left an invalid `blockIndex` stored and displayed, while `resetMatcher` silently fell back the *matcher* to token 0 — engine and UI disagreeing about where the cursor actually was. Fixed with a `clampedPosition` helper that clamps both block and word index to the script's actual bounds.
+- **Comment 6's test-only half** — no separate fix needed beyond the `async`-callback change above; the test (`startPointSelectionSticks`) already asserted the right thing, it was the production code that was racing underneath it.
+
+### Tests added
+
+`pausedIgnoresLateASRResult`, `adjustPositionClampsUpperBound` (TrackingEngine level), `loadScriptResetsStaleTracking` (AppState level). 53 core (was 51) + 10 app (was 9) tests, all green. The concurrency-ordering fix itself (comment 2) isn't separately unit-tested — reliably reproducing a Task race in a deterministic test is its own can of worms — but the architectural change (synchronous ordered enqueue + single consumer) makes the failure mode structurally impossible rather than just less likely.
+
+---
+
 ## 2026-09-10 (later) — Start-point selection sticks; recording telemetry is finally live
 
 Two of the "known gaps" flagged earlier, done properly (asked to think from first principles so this doesn't need revisiting).

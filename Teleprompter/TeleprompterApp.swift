@@ -44,6 +44,13 @@ final class AppState: @unchecked Sendable {
         let script = Script(rawContent: rawText)
         currentScript = script
         formattedScript = await formatter.format(rawText)
+        // A new script invalidates any position/status left over from a
+        // previous one. Without this, a stale `trackingPosition` (e.g. block
+        // 5 from a longer script that was just replaced) would carry into
+        // the next `startRecording` via its `position ?? trackingPosition`
+        // fallback — and might not even be a valid position in the new script.
+        trackingPosition = TrackingPosition()
+        trackingStatus = .paused
         if let formattedScript {
             await trackingEngine.configure(script: formattedScript.tokens)
         }
@@ -84,15 +91,20 @@ final class AppState: @unchecked Sendable {
             return
         }
 
+        startASRConsumer()
+
+        // `onResult` only synchronously enqueues — the actual processing
+        // happens one at a time in the consumer task started above. ASR
+        // partial results can arrive faster than one full asr -> matcher ->
+        // position -> UI round trip completes; spawning an independent Task
+        // per callback (the old approach) let those races reorder
+        // `processASRResult` calls relative to when the results actually
+        // arrived, which could rewind the matcher's `consumedSpokenCount` as
+        // if a *newer* transcript were a stale ASR revision of an *older*
+        // one. `AsyncStream.Continuation.yield` is synchronous and
+        // FIFO-ordered, so this can't happen anymore.
         recognizer.onResult = { [weak self] result in
-            guard let self else { return }
-            Task {
-                let recorder = await self.trackingEngine.latencyRecorder
-                let cycle = await recorder.beginCycle()
-                await recorder.mark(.asrReceived, forCycle: cycle)
-                await self.trackingEngine.processASRResult(result, latencyCycle: cycle)
-                await recorder.completePendingCycle(uiReceivedAt: Date().timeIntervalSinceReferenceDate)
-            }
+            self?.asrQueue?.yield((result, Date().timeIntervalSinceReferenceDate))
         }
 
         // TrackingEngine only re-evaluates tracking → uncertain → degraded
@@ -129,10 +141,45 @@ final class AppState: @unchecked Sendable {
 
     func stopRecording() async {
         await recognizer.stop()
+        // Stop new work first, then wait for whatever was already queued or
+        // mid-flight to actually finish (or notice the cancellation and bail
+        // — see the `Task.isCancelled` check in `startASRConsumer`) before
+        // pausing the engine. Otherwise a result that snuck in right as the
+        // user hit stop could still land after `pause()` and — since
+        // `processASRResult` had no way to know recording had ended — flip
+        // status back to `.tracking` or emit telemetry into a session that's
+        // about to be closed.
+        asrQueue?.finish()
+        asrConsumerTask?.cancel()
+        await asrConsumerTask?.value
+        asrQueue = nil
+        asrConsumerTask = nil
+
         await trackingEngine.pause()
         _ = await telemetry.endSession()
         isRecording = false
         countdownRemaining = nil
+    }
+
+    // MARK: - ASR result queue
+
+    private var asrQueue: AsyncStream<(ASRResult, TimeInterval)>.Continuation?
+    private var asrConsumerTask: Task<Void, Never>?
+
+    private func startASRConsumer() {
+        asrConsumerTask?.cancel()
+        let (stream, continuation) = AsyncStream<(ASRResult, TimeInterval)>.makeStream()
+        asrQueue = continuation
+        asrConsumerTask = Task { [weak self] in
+            for await (result, receivedAt) in stream {
+                guard !Task.isCancelled, let self else { break }
+                let recorder = await self.trackingEngine.latencyRecorder
+                let cycle = await recorder.beginCycle()
+                await recorder.mark(.asrReceived, forCycle: cycle, at: receivedAt)
+                await self.trackingEngine.processASRResult(result, latencyCycle: cycle)
+                _ = await recorder.completePendingCycle(uiReceivedAt: Date().timeIntervalSinceReferenceDate)
+            }
+        }
     }
 
     // MARK: - Position
@@ -173,28 +220,36 @@ final class AppState: @unchecked Sendable {
     private func registerTrackingCallbacksIfNeeded() async {
         guard !callbacksRegistered else { return }
         callbacksRegistered = true
+        // These callbacks are `async` on `TrackingEngine`'s side, and
+        // `notifyStatusChange`/`notifyPositionUpdate`/`notifyEvent` there
+        // `await` them — so awaiting the MainActor hop directly here (rather
+        // than spawning a detached `Task` and returning immediately) means
+        // `jumpTo`/`start`/etc. don't return until `trackingPosition` and
+        // `trackingStatus` have actually been assigned. That's what makes a
+        // test like "tap before recording, then immediately assert the
+        // position" deterministic instead of a timing race.
         await trackingEngine.setCallbacks(
             onStatusChange: { [weak self] status in
-                Task { @MainActor in
-                    guard let self else { return }
-                    // A pre-recording start-point tap re-arms the engine's
-                    // internal state to `.tracking` so it's ready the instant
-                    // recording starts, but the user isn't speaking yet — the
-                    // visible indicator should read "paused" until recording
-                    // actually begins.
-                    self.trackingStatus = self.isRecording ? status : .paused
-                }
+                await self?.applyStatus(status)
             },
             onPositionUpdate: { [weak self] position in
-                Task { @MainActor in
-                    self?.trackingPosition = position
-                }
+                await self?.applyPosition(position)
             },
             onEvent: { [weak self] event in
-                Task { @MainActor in
-                    await self?.telemetry.recordEvent(event)
-                }
+                await self?.telemetry.recordEvent(event)
             }
         )
+    }
+
+    /// A pre-recording start-point tap re-arms the engine's internal state to
+    /// `.tracking` so it's ready the instant recording starts, but the user
+    /// isn't speaking yet — the visible indicator should read "paused" until
+    /// recording actually begins.
+    private func applyStatus(_ status: TrackingStatus) {
+        trackingStatus = isRecording ? status : .paused
+    }
+
+    private func applyPosition(_ position: TrackingPosition) {
+        trackingPosition = position
     }
 }
