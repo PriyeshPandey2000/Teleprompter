@@ -177,7 +177,8 @@ final class AppState: @unchecked Sendable {
         asrConsumerTask = nil
 
         await trackingEngine.pause()
-        _ = await telemetry.endSession()
+        let latency = await latencySummary()
+        _ = await telemetry.endSession(latency: latency)
         isRecording = false
         countdownRemaining = nil
     }

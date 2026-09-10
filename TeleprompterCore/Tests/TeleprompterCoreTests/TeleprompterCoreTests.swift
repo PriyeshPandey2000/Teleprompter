@@ -537,6 +537,21 @@ struct LatencyRecorderTests {
         let summary = await recorder.summary()
         #expect(summary.completedCycles == 3)
     }
+
+    @Test("Computes asr partial cadence from consecutive arrival gaps")
+    func asrCadence() async throws {
+        let recorder = LatencyRecorder()
+        for arrival in [100.0, 400.0, 700.0] {
+            let cycle = await recorder.beginCycle()
+            await recorder.mark(.asrReceived, forCycle: cycle, at: arrival)
+            _ = await recorder.completePendingCycle(uiReceivedAt: arrival + 5)
+        }
+        let summary = await recorder.summary()
+        let cadence = try #require(summary.asrCadence)
+        #expect(cadence.count == 2)
+        #expect(cadence.mean == 300)
+        #expect(cadence.p50 == 300)
+    }
 }
 
 @Suite("Tracking Envelope")
@@ -1122,6 +1137,40 @@ struct ScrollTimingTests {
         #expect(duration >= ScrollTiming.minDuration)
         #expect(duration <= ScrollTiming.maxDuration)
     }
+
+    @Test("Continuous rate paces with velocity when velocity is measurable")
+    func continuousRatePacesWithVelocity() {
+        // Small distance relative to pointsPerToken/maxDuration so the paced
+        // rate — not the large-jump floor — is what's under test.
+        let slow = ScrollTiming.continuousRate(distance: 20, velocity: 1.0, pointsPerToken: 20)
+        let fast = ScrollTiming.continuousRate(distance: 20, velocity: 2.0, pointsPerToken: 20)
+        #expect(fast > slow)
+        #expect(slow == 1.0 * 20)
+        #expect(fast == 2.0 * 20)
+    }
+
+    @Test("Continuous rate falls back to the snap-glide pace at zero velocity")
+    func continuousRateSnapsAtZeroVelocity() {
+        let rate = ScrollTiming.continuousRate(distance: 40, velocity: 0, pointsPerToken: 20)
+        #expect(rate == 40 / ScrollTiming.noVelocityDuration)
+    }
+
+    @Test("Continuous rate is floored so a large jump still closes within maxDuration")
+    func continuousRateFloorsLargeJumps() {
+        // A big re-anchor jump while still reading slowly: the paced rate
+        // alone would take far longer than maxDuration to close the gap.
+        let distance = 2000.0
+        let rate = ScrollTiming.continuousRate(distance: distance, velocity: 0.5, pointsPerToken: 20)
+        let timeToClose = distance / rate
+        #expect(timeToClose <= ScrollTiming.maxDuration)
+    }
+
+    @Test("Continuous rate is symmetric for backward moves")
+    func continuousRateSymmetricForNegativeDistance() {
+        let forward = ScrollTiming.continuousRate(distance: 100, velocity: 1.0, pointsPerToken: 20)
+        let backward = ScrollTiming.continuousRate(distance: -100, velocity: 1.0, pointsPerToken: 20)
+        #expect(forward == backward)
+    }
 }
 
 @Suite("Velocity in the Match Pipeline")
@@ -1253,5 +1302,118 @@ struct VelocityInMatchPipelineTests {
         let after = await engine.getCurrentState()
         #expect(after.status == .tracking)
         #expect(after.position.velocity > 0, "velocity must not be depressed by a backwards-arriving result")
+    }
+}
+
+// MARK: - Gate 1 (≤200ms perceived response)
+
+/// PRD Gate 1: the asr → matcher → position → UI round trip must complete in
+/// well under 200ms. The dominant cost for a real reader is the Speech
+/// framework's partial-result cadence (outside our control); everything from
+/// `processASRResult` to the position callback reaching the main actor is
+/// ours, and this suite pins it down with the real clock so a regression in
+/// the controllable pipeline fails the gate.
+@Suite("Gate 1 Pipeline Latency")
+struct Gate1PipelineLatencyTests {
+    @Test("Full tracking pipeline completes under the 200ms gate in practice")
+    func pipelineUnderGate() async throws {
+        let formatter = ScriptFormatter()
+        let tokens = await formatter.format(ScriptMatcherTests.sampleScript).tokens
+        let full = ScriptMatcherTests.sampleScript.replacingOccurrences(of: "\n", with: " ")
+        let words = ScriptMatcher.tokenizeSpoken(full, config: .default)
+
+        let engine = TrackingEngine()
+        await engine.configure(script: tokens)
+        await engine.start()
+
+        // Models the UI side: the engine's `onPositionUpdate` hops to the
+        // main actor (as AppState.applyPosition does) before the caller
+        // considers the cycle complete.
+        final class UIApplyCount: @unchecked Sendable {
+            let lock = NSLock()
+            var count = 0
+            func increment() {
+                lock.lock()
+                count += 1
+                lock.unlock()
+            }
+        }
+        let applied = UIApplyCount()
+        await engine.setCallbacks(
+            onStatusChange: { _ in },
+            onPositionUpdate: { _ in
+                await MainActor.run { applied.increment() }
+            },
+            onEvent: { _ in }
+        )
+
+        // Feed the script word by word — every feed must advance the cursor
+        // and emit a position update, so every cycle exercises the whole
+        // pipeline and the awaited main-actor hop.
+        var partial = ""
+        var timings: [TimeInterval] = []
+        let clock = ContinuousClock()
+        for word in words {
+            partial = partial.isEmpty ? word : "\(partial) \(word)"
+            let start = clock.now
+            await engine.processASRResult(ASRResult(transcript: partial))
+            let duration = start.duration(to: clock.now).components
+            timings.append(Double(duration.seconds) + Double(duration.attoseconds) * 1e-18)
+        }
+
+        let sorted = timings.sorted()
+        let mean = sorted.reduce(0, +) / Double(sorted.count)
+        let p95Index = max(0, min(Int(ceil(Double(sorted.count) * 0.95)) - 1, sorted.count - 1))
+        let p95 = sorted[p95Index]
+        let maxTime = sorted.last!
+
+        #expect(sorted.count == words.count, "every fed word must produce one measured cycle")
+        #expect(applied.count == words.count, "every matched feed must land a position update on the main actor")
+        #expect(mean < 0.05, "mean pipeline latency must stay far under the 200ms gate")
+        #expect(maxTime < 0.2, "no single cycle may exceed the 200ms gate")
+
+        print(
+            "Gate 1 measured: N=\(sorted.count) mean=\(String(format: "%.3f", mean * 1000))ms " +
+            "p95=\(String(format: "%.3f", p95 * 1000))ms max=\(String(format: "%.3f", maxTime * 1000))ms"
+        )
+    }
+}
+
+// MARK: - Latency stamped into recording telemetry
+
+@Suite("Latency in Recording Telemetry")
+struct RecordingLatencyStampTests {
+    @Test("endSession(latency:) stamps gate-1 stats onto the finished session")
+    func stampsLatency() async throws {
+        let telemetry = RecordingTelemetry()
+        _ = await telemetry.startSession(scriptID: UUID(), takeNumber: 1)
+
+        let recorder = LatencyRecorder()
+        for i in 0..<5 {
+            let cycle = await recorder.beginCycle()
+            await recorder.mark(.asrReceived, forCycle: cycle, at: Double(i) * 10)
+            await recorder.mark(.matcherStarted, forCycle: cycle, at: Double(i) * 10 + 1)
+            await recorder.mark(.matcherFinished, forCycle: cycle, at: Double(i) * 10 + 2)
+            await recorder.mark(.positionEmitted, forCycle: cycle, at: Double(i) * 10 + 3)
+            _ = await recorder.completePendingCycle(uiReceivedAt: Double(i) * 10 + 5)
+        }
+        let summary = await recorder.summary()
+        let session = try #require(await telemetry.endSession(latency: summary))
+
+        #expect(session.endTime != nil)
+        #expect(session.trackingLatencyMean == 5)
+        #expect(session.trackingLatencyP95 == 5)
+        #expect(session.trackingLatencyP99 == 5)
+    }
+
+    @Test("endSession() with no tracking leaves latency stats nil")
+    func leavesNilWithoutLatency() async throws {
+        let telemetry = RecordingTelemetry()
+        _ = await telemetry.startSession(scriptID: UUID(), takeNumber: 1)
+
+        let session = try #require(await telemetry.endSession())
+        #expect(session.trackingLatencyMean == nil)
+        #expect(session.trackingLatencyP95 == nil)
+        #expect(session.trackingLatencyP99 == nil)
     }
 }

@@ -4,7 +4,9 @@ import TeleprompterCore
 struct TeleprompterView: View {
     let formattedScript: FormattedScript
     @Environment(AppState.self) private var appState
-    @State private var scrollProxy: ScrollViewProxy?
+    @State private var scrollState = ContinuousScrollState()
+    @State private var blockFrames: [Int: CGRect] = [:]
+    @State private var isAnimating = false
 
     @AppStorage("fontSize") private var fontSize: Double = 36
     @AppStorage("mirrorMode") private var mirrorMode = false
@@ -60,46 +62,100 @@ struct TeleprompterView: View {
 
     // MARK: - Script Content
 
+    /// Continuous word-pixel panning: the viewport doesn't jump block to
+    /// block, it chases the current confirmed position every frame at the
+    /// reader's measured pace (`ScrollTiming.continuousRate`). This is what
+    /// keeps the page visibly moving between ASR partials instead of
+    /// freezing and then jumping — the freeze-then-glide cadence that reads
+    /// as "laggy" even though the asr → UI pipeline itself is far under
+    /// budget (see `PerformanceView`).
+    ///
+    /// Only `scrollState.offset` (a display-only pixel value) is driven by
+    /// this extrapolation. `appState.trackingPosition` — the word-highlight,
+    /// recovery, and telemetry truth — is never written here; the target
+    /// this view chases is always the *last confirmed* position, and it
+    /// never chases past it. During a real pause, reading velocity decays to
+    /// zero (`ReadingVelocityEstimator`) and the target simply stops
+    /// changing, so the offset arrives and holds — PRD's "UNCERTAIN never
+    /// moves the script" falls out of this structurally, not as a special
+    /// case bolted on here.
     private var scriptContent: some View {
-        ScrollViewReader { proxy in
-            ScrollView(.vertical, showsIndicators: false) {
-                LazyVStack(alignment: .leading, spacing: 32) {
+        GeometryReader { viewport in
+            TimelineView(.animation(paused: !isAnimating)) { context in
+                VStack(alignment: .leading, spacing: 32) {
                     ForEach(Array(formattedScript.blocks.enumerated()), id: \.element.id) { index, block in
                         blockView(block, at: index)
-                            .id("block-\(index)")
                     }
                 }
                 .padding(.horizontal, 120)
                 .padding(.vertical, 80)
+                .coordinateSpace(name: "scriptContent")
+                .offset(y: -scrollState.offset)
+                .onChange(of: context.date) { _, date in
+                    tick(now: date, viewportHeight: viewport.size.height)
+                }
             }
-            .onAppear { scrollProxy = proxy }
-            .onChange(of: appState.trackingPosition.blockIndex) { oldIndex, newIndex in
-                scrollTo(block: newIndex, from: oldIndex, using: proxy)
+            .frame(width: viewport.size.width, height: viewport.size.height, alignment: .topLeading)
+            .clipped()
+            .onPreferenceChange(BlockFramePreferenceKey.self) { frames in
+                blockFrames = frames
             }
+        }
+        .onChange(of: appState.trackingPosition) { _, _ in
+            isAnimating = true
+        }
+        .onAppear {
+            isAnimating = true
         }
     }
 
-    /// Moves the script so `index` sits at the center of the viewport,
-    /// gliding at the reader's measured pace instead of snapping. Duration
-    /// scales inversely with reading velocity (`ScrollTiming`), so a fast
-    /// speaker scrolls briskly and a slow reader gets a gentle, long glide —
-    /// never a 0.15s teleport on a big move.
-    private func scrollTo(block index: Int, from oldIndex: Int, using proxy: ScrollViewProxy) {
-        let words = wordsBetween(oldIndex, index)
-        let duration = ScrollTiming.travelDuration(words: words, velocity: appState.trackingPosition.velocity)
-        withAnimation(.easeOut(duration: duration)) {
-            proxy.scrollTo("block-\(index)", anchor: .center)
-        }
+    /// Advances `scrollState` one frame toward the current confirmed
+    /// position, then decides whether another frame is needed. Idles (stops
+    /// scheduling `.animation` ticks) once settled and not recording, so an
+    /// open-but-inactive teleprompter window — the editor, a paused session,
+    /// Settings open — doesn't pay for a perpetual 60fps redraw.
+    private func tick(now: Date, viewportHeight: CGFloat) {
+        guard let target = targetOffset(viewportHeight: viewportHeight) else { return }
+        scrollState.tick(
+            now: now,
+            target: target,
+            velocity: appState.trackingPosition.velocity,
+            pointsPerToken: pointsPerToken(for: appState.trackingPosition.blockIndex)
+        )
+        isAnimating = scrollState.offset != target || appState.isRecording
     }
 
-    /// Word distance between two block starts, in the matcher's flat token
-    /// space. Used to size the scroll glide to the reader's reading speed.
-    private func wordsBetween(_ a: Int, _ b: Int) -> Int {
-        guard let ta = formattedScript.tokens.tokenIndex(block: a, word: 0),
-              let tb = formattedScript.tokens.tokenIndex(block: b, word: 0) else {
-            return 0
-        }
-        return abs(tb - ta)
+    /// Pixel offset that puts the current confirmed word at the reading
+    /// line (viewport center, matching the previous `.center` block anchor).
+    /// Interpolates within the current block by word fraction — block frames
+    /// come from `blockFrames` (measured via `BlockFramePreferenceKey`);
+    /// `nil` only while the target block's frame hasn't been measured yet
+    /// (first frame or two after a script loads), in which case the offset
+    /// holds until it resolves.
+    private func targetOffset(viewportHeight: CGFloat) -> CGFloat? {
+        let block = appState.trackingPosition.blockIndex
+        guard let frame = blockFrames[block] else { return nil }
+        let tokenCount = tokenCount(inBlock: block)
+        guard tokenCount > 0 else { return frame.minY - viewportHeight * 0.5 }
+        let fraction = min(1.0, Double(appState.trackingPosition.wordIndex) / Double(tokenCount))
+        let y = frame.minY + CGFloat(fraction) * frame.height
+        return y - viewportHeight * 0.5
+    }
+
+    /// Current block's pixel density — points per matcher token — recomputed
+    /// every tick so it tracks font-size changes and per-block line-wrap
+    /// differences automatically instead of needing its own invalidation.
+    private func pointsPerToken(for block: Int) -> CGFloat {
+        guard let frame = blockFrames[block] else { return 0 }
+        let tokenCount = tokenCount(inBlock: block)
+        guard tokenCount > 0 else { return 0 }
+        return frame.height / CGFloat(tokenCount)
+    }
+
+    private func tokenCount(inBlock block: Int) -> Int {
+        let blockStart = formattedScript.tokens.blockStart
+        guard block >= 0, block + 1 < blockStart.count else { return 0 }
+        return max(0, blockStart[block + 1] - blockStart[block])
     }
 
     /// Opacity for text that's behind the reader's current position — dimmed
@@ -150,6 +206,14 @@ struct TeleprompterView: View {
             }
         }
         .animation(.easeInOut(duration: 0.12), value: appState.trackingPosition)
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: BlockFramePreferenceKey.self,
+                    value: [index: proxy.frame(in: .named("scriptContent"))]
+                )
+            }
+        }
         .onTapGesture {
             Task {
                 let position = TrackingPosition(blockIndex: index, wordIndex: 0, confidence: 1.0)
@@ -350,5 +414,59 @@ struct TrackingStatusBanner: View {
         .padding(.vertical, 8)
         .background(.black.opacity(0.7), in: Capsule())
         .contentShape(Capsule())
+    }
+}
+
+// MARK: - Block Frame Measurement
+
+/// Reports each script block's on-screen frame (in the `"scriptContent"`
+/// named coordinate space) so `TeleprompterView` can compute a continuous
+/// scroll target without a block-id-based `ScrollViewReader`. Merged rather
+/// than overwritten so partial updates from individual blocks accumulate.
+private struct BlockFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [Int: CGRect] = [:]
+
+    static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+// MARK: - Continuous Scroll State
+
+/// Drives the teleprompter's pixel scroll offset one frame at a time, always
+/// chasing the last confirmed position rather than snapping to it. Reference
+/// type so `TeleprompterView`'s `TimelineView` tick can mutate `offset`
+/// every frame without re-evaluating the view's other `@State`.
+///
+/// This only ever produces a *display* value — it never feeds back into
+/// `AppState.trackingPosition` or any tracking/recovery/telemetry logic. See
+/// `TeleprompterView.scriptContent`'s doc comment for why that boundary is
+/// what keeps this safe from the dead-reckoning risk a naive "extrapolate
+/// the reader's position" approach would carry.
+@Observable
+final class ContinuousScrollState {
+    private(set) var offset: CGFloat = 0
+    private var lastTick: Date?
+
+    /// Advances `offset` toward `target` by one frame's worth of motion at
+    /// `velocity` (tokens/sec), converted to points/sec via `pointsPerToken`.
+    func tick(now: Date, target: CGFloat, velocity: Double, pointsPerToken: CGFloat) {
+        defer { lastTick = now }
+        guard let last = lastTick else {
+            offset = target
+            return
+        }
+        let dt = now.timeIntervalSince(last)
+        // A stale or backgrounded tick (window unfocused, app suspended)
+        // would otherwise produce a huge `dt` and a single-frame teleport —
+        // skip it and let the next real tick resume from where it left off.
+        guard dt > 0, dt < 0.5 else { return }
+
+        let distance = Double(target - offset)
+        guard distance != 0 else { return }
+
+        let rate = ScrollTiming.continuousRate(distance: distance, velocity: velocity, pointsPerToken: Double(pointsPerToken))
+        let step = CGFloat(rate * dt)
+        offset = abs(CGFloat(distance)) <= step ? target : offset + (distance > 0 ? step : -step)
     }
 }

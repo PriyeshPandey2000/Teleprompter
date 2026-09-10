@@ -36,4 +36,21 @@ public enum ScrollTiming {
         }
         return min(max(duration, minDuration), maxDuration)
     }
+
+    /// Points/sec closing rate for continuously chasing a scroll target, one
+    /// frame at a time, instead of animating a single block-to-block jump.
+    ///
+    /// `distance` and `pointsPerToken` are in points; `velocity` is in
+    /// tokens/sec (the same matcher-token space `TrackingPosition.velocity`
+    /// already uses). Paced by reading velocity when it's measurable — a
+    /// faster reader closes small continuous gaps faster, exactly like
+    /// `travelDuration`. Floored so a large jump (recenter, tap-to-jump, a
+    /// backward re-anchor) still closes within `maxDuration` even though
+    /// nothing here is animating a single discrete transition anymore — same
+    /// three constants govern both functions, no new magic numbers.
+    public static func continuousRate(distance: Double, velocity: Double, pointsPerToken: Double) -> Double {
+        let pacedRate = velocity > 0 ? velocity * pointsPerToken : abs(distance) / noVelocityDuration
+        let floorRate = abs(distance) / maxDuration
+        return max(pacedRate, floorRate)
+    }
 }

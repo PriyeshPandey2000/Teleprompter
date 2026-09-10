@@ -4,6 +4,60 @@ Running log of implementation progress and the reasoning behind non-obvious deci
 
 ---
 
+## 2026-09-10 (night) — Continuous word-pixel panning: the scroll no longer freezes between ASR partials
+
+Gate 1 (previous entry) proved the asr → matcher → position → UI pipeline is ~2000× under its 200ms budget. That measurement also explained a real user complaint about perceived lag: the pipeline isn't the bottleneck, the **asr partial cadence** is. Apple's on-device Speech framework only hands us a new transcript every ~250–500ms, and the existing scroll (`ScrollViewReader.scrollTo` on a block id, added in the velocity/scroll-smoothing PR) had nothing to animate between those partials — it sat frozen, then glided to the next block. Freeze-then-glide reads as lag even though every number underneath it is fast.
+
+### The fix: decouple the visible scroll position from ASR arrival
+
+The scroll offset now chases the *last confirmed* position continuously, one frame at a time, instead of jumping block to block on each partial. This is PRD §31's framing ("given the last 10 seconds of movement, X is probably the position") extended from the matcher, where it already governed *what's trusted*, to the renderer, where it now governs *how confirmed truth gets drawn*.
+
+**Why this doesn't reopen the dead-reckoning risk that was explicitly rejected for the matcher itself:** the extrapolation only ever touches a new, display-only pixel value (`ContinuousScrollState.offset`). `AppState.trackingPosition` — the word-highlight, recovery, and telemetry truth — is never written by the scroll layer; it still only changes when the matcher confirms a word. The offset continuously chases the last confirmed target and never invents a target beyond it, so during a real pause the reading-velocity estimate (`ReadingVelocityEstimator`) decays to zero, the target stops changing, and the offset simply arrives and holds. PRD's "UNCERTAIN never moves the script" falls out of that structurally rather than needing its own special case in the view.
+
+### What shipped (TeleprompterCore)
+
+- **`ScrollTiming.continuousRate(distance:velocity:pointsPerToken:)`** — points/sec closing rate for a per-frame chase, reusing the same three constants (`minDuration`, `maxDuration`, `noVelocityDuration`) that already governed the old one-shot `travelDuration`. Paced by reading velocity when it's measurable; floored so a large jump (recenter, tap-to-jump, a backward re-anchor) still closes within `maxDuration` even though nothing is animating a single discrete transition anymore. 5 new tests alongside the existing `Scroll Timing` suite.
+
+### What shipped (app)
+
+- **`TeleprompterView`** — replaced the block-granular `ScrollViewReader`/`scrollTo`/`wordsBetween` with a `TimelineView(.animation)`-driven `ContinuousScrollState`, Apple's documented CADisplayLink-equivalent for SwiftUI. `LazyVStack` → `VStack` for the block stack: continuous panning needs every block's on-screen frame to compute a target offset, and `LazyVStack` only lays out near-visible blocks — a target block that hasn't rendered yet would have no measured frame. Scripts are text, not media, so eager layout of the whole document is cheap.
+- Block frames are measured via a new `BlockFramePreferenceKey` (`GeometryReader` + `.preference` per block, merged into a `[Int: CGRect]`), read in a stable `"scriptContent"` coordinate space defined *before* the animated `.offset` is applied so measurements stay independent of the very offset they're used to compute.
+- The animation loop self-idles (`isAnimating`) once the offset settles and the app isn't recording, so an open-but-inactive teleprompter window doesn't pay for a perpetual 60fps redraw.
+- `wordFlow`'s word-highlight logic, mirror/flip, tap-to-jump, keyboard shortcuts, and all the overlays are untouched — they only ever read `appState.trackingPosition`/`trackingStatus`, which the new scroll layer never writes.
+
+### Also in this pass
+
+- Fixed a build-breaking bug in `LatencyRecorder.summary()`: an added `let arrivals = ...` line ahead of the trailing `LatencySummary(...)` expression silently killed Swift's implicit-return (only applies to single-statement bodies), caught by `xcodebuild test` after `swift test`/`xcodebuild build` had both stale-cached past it.
+
+### Verified
+
+TeleprompterCore: 77 tests / 16 suites green (was 72). App: 18 tests / 3 suites green. Build succeeds, no new warnings. Launched the built app twice (before and after the scroll rewrite) to confirm no startup crash. `TeleprompterView` has no unit tests of its own (SwiftUI render path, consistent with every prior change to this file) — manual verification of the actual on-screen feel (read a script aloud at varying pace, confirm the page creeps instead of freezing, confirm a real pause still freezes it) is still pending, same as the word-highlight and velocity/scroll-smoothing PRs before it.
+
+---
+
+## 2026-09-10 (late) — PRD Gate 1 landed: the asr → UI pipeline is measured, visible, and ~2000× under budget
+
+Gate 1 (PRD §42, P0 #1 in §40) is "≤ 200ms perceived response." Most of that budget belongs to Apple's Speech framework — the partial-result cadence is outside our code — so the increment nails down the part we own: the **asr → matcher → position → UI** round trip, which was already instrumented by `LatencyRecorder` but never proved, surfaced, or persisted.
+
+### What shipped (TeleprompterCore)
+
+- **`RecordingSession`** gained `trackingLatencyMean/P95/P99` (optional) and `finish(latency: LatencySummary)`. `RecordingTelemetry.endSession(latency:)` stamps the take's total asr → UI distribution, so every session that actually tracked the reader carries its measured latency; sessions where ASR never engaged stay `nil`.
+- **Gate-1 regression test (`Gate1PipelineLatencyTests`)** — drives the *real* `TrackingEngine` word-by-word through the full sample script with the **real clock** (no `TestClock`), and every feed's `onPositionUpdate` hops to the main actor exactly like `AppState.applyPosition`. Measures each cycle's wall time and asserts:
+  - every single cycle < 200ms (the gate, structurally),
+  - the mean stays < 50ms (10× headroom even on slow CI).
+  
+  **Measured on this machine: mean ~0.07–0.11ms, p95 < 0.2ms, max ~1–2ms across 40 cycles** (varies slightly per run). The pipeline we control is thousands of times under budget — the perception limit, if it ever shows up, is the recognizer's cadence, not our code.
+
+### What shipped (app)
+
+- **`PerformanceView`** — a live Gate-1 panel in Settings (Cmd+, → "Performance"), refreshed every 0.5s while it's open. Shows a PASS/over-verdict banner on total p95 and per-segment stats (cycles, mean, p95) for all five segments (total, asr→matcher, matcher, matcher→emit, emit→UI). `AppState.stopRecording` now folds the session's latency summary into telemetry automatically.
+
+### Verified
+
+TeleprompterCore: 72 tests / 16 suites green; app: 18 tests / 3 suites green; build succeeds. New tests: the real-clock gate benchmark, `endSession(latency:)` stamping (mean/p95/p99 == 5 on synthetic samples; `nil` without tracking), and an AppState-level take where word-by-word speech through the mock recognizer produces a session with non-nil latency stamps at or under 200ms p95.
+
+---
+
 ## 2026-09-10 — Velocity/scroll smoothing: the viewport glides at the reader's measured pace
 
 Step past the last extension of the "how should the screen get there?" half of the tracking pipeline (next item in the agreed order in the escalation entry below). Before this, every position update recentered the block with a fixed 0.15s ease — the scroll never moved at reading speed, and a far skip looked like a teleport.

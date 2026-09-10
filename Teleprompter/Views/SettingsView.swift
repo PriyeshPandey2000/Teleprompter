@@ -32,8 +32,11 @@ struct SettingsView: View {
 
             KeyboardShortcutsView()
                 .tabItem { Label("Shortcuts", systemImage: "keyboard") }
+
+            PerformanceView()
+                .tabItem { Label("Performance", systemImage: "speedometer") }
         }
-        .frame(width: 500, height: 350)
+        .frame(width: 560, height: 420)
     }
 }
 
