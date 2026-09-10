@@ -1020,3 +1020,175 @@ struct RepeatedContextStressTests {
         #expect(drive.snapshot.missStreak == 1)
     }
 }
+
+@Suite("Reading Velocity")
+struct ReadingVelocityEstimatorTests {
+    @Test("Sustained reading converges on the actual words/sec rate")
+    func convergesOnSustainedRate() {
+        var estimator = ReadingVelocityEstimator()
+        for _ in 0..<50 {
+            estimator.update(deltaTokens: 2, elapsed: 1.0)
+        }
+        #expect(abs(estimator.velocity - 2.0) < 0.5)
+    }
+
+    @Test("Slower reading lands lower than faster reading")
+    func slowerIsLowerThanFaster() {
+        var slow = ReadingVelocityEstimator()
+        var fast = ReadingVelocityEstimator()
+        for _ in 0..<50 {
+            slow.update(deltaTokens: 1, elapsed: 1.0)
+            fast.update(deltaTokens: 5, elapsed: 1.0)
+        }
+        #expect(slow.velocity < fast.velocity)
+    }
+
+    @Test("A runaway burst is clamped, not believed")
+    func burstIsClamped() {
+        var estimator = ReadingVelocityEstimator()
+        estimator.update(deltaTokens: 1_000, elapsed: 1.0)
+        #expect(estimator.velocity <= estimator.clampMax)
+    }
+
+    @Test("A pause decays the estimate back to zero")
+    func pauseDecaysToZero() {
+        var estimator = ReadingVelocityEstimator()
+        for _ in 0..<50 {
+            estimator.update(deltaTokens: 2, elapsed: 1.0)
+        }
+        #expect(estimator.velocity > 1.5)
+        for _ in 0..<10 {
+            estimator.update(deltaTokens: 0, elapsed: 5.0)
+        }
+        #expect(estimator.velocity == 0)
+    }
+
+    @Test("Zero elapsed is a no-op")
+    func zeroElapsedIsNoOp() {
+        var estimator = ReadingVelocityEstimator()
+        estimator.update(deltaTokens: 2, elapsed: 1.0)
+        let before = estimator.velocity
+        estimator.update(deltaTokens: 5, elapsed: 0)
+        #expect(estimator.velocity == before)
+    }
+
+    @Test("Reset drops the estimate to zero")
+    func resetDropsToZero() {
+        var estimator = ReadingVelocityEstimator()
+        estimator.update(deltaTokens: 2, elapsed: 1.0)
+        estimator.reset()
+        #expect(estimator.velocity == 0)
+    }
+}
+
+@Suite("Scroll Timing")
+struct ScrollTimingTests {
+    @Test("Zero or unknown velocity snaps instead of gliding")
+    func zeroVelocitySnaps() {
+        #expect(ScrollTiming.travelDuration(words: 30, velocity: 0) == ScrollTiming.noVelocityDuration)
+        #expect(ScrollTiming.travelDuration(words: 30, velocity: -1) == ScrollTiming.noVelocityDuration)
+    }
+
+    @Test("A faster reader glides faster than a slow one")
+    func fasterReaderScrollsFaster() {
+        let slow = ScrollTiming.travelDuration(words: 30, velocity: 1.0)
+        let fast = ScrollTiming.travelDuration(words: 30, velocity: 2.0)
+        #expect(fast < slow)
+    }
+
+    @Test("Longer moves take at least as long as short ones")
+    func longerMovesTakeLonger() {
+        let short = ScrollTiming.travelDuration(words: 20, velocity: 6.0)
+        let long = ScrollTiming.travelDuration(words: 240, velocity: 6.0)
+        #expect(long >= short)
+    }
+
+    @Test("Duration is bounded for any input")
+    func durationIsBounded() {
+        for words in [0, 1, 40, 240] {
+            for velocity in [0.1, 1.0, 10.0] {
+                let duration = ScrollTiming.travelDuration(words: words, velocity: velocity)
+                #expect(duration >= ScrollTiming.minDuration)
+                #expect(duration <= ScrollTiming.maxDuration)
+            }
+        }
+    }
+
+    @Test("A far skip sweeps coherently instead of teleporting")
+    func farSkipSweeps() {
+        // 240 words at brisk pace: fast but not instant, scaled past a single
+        // glance so the reader doesn't lose their place.
+        let duration = ScrollTiming.travelDuration(words: 240, velocity: 6.0)
+        #expect(duration >= ScrollTiming.minDuration)
+        #expect(duration <= ScrollTiming.maxDuration)
+    }
+}
+
+@Suite("Velocity in the Match Pipeline")
+struct VelocityInMatchPipelineTests {
+    private func tokens() async -> ScriptTokens {
+        let formatter = ScriptFormatter()
+        return await formatter.format(ScriptMatcherTests.sampleScript).tokens
+    }
+
+    @Test("PositionEngine emits a position carrying velocity after sustained matched feeds")
+    func positionCarriesVelocity() async {
+        let clock = TestClock()
+        let engine = PositionEngine()
+        await engine.configure(script: await tokens())
+        await engine.reset(toToken: 0)
+
+        await engine.feed(transcript: "We need to make sales", at: clock.now)
+        clock.set(2.0)
+        let outcome = await engine.feed(
+            transcript: "We need to make sales now and grow the business",
+            at: clock.now
+        )
+
+        #expect(outcome.position != nil)
+        #expect(outcome.position?.velocity ?? 0 > 0)
+    }
+
+    @Test("A fresh session does not invent velocity until real time passes")
+    func freshSessionDoesNotInventVelocityThenBuilds() async {
+        let clock = TestClock()
+        let engine = PositionEngine()
+        await engine.configure(script: await tokens())
+        await engine.reset(toToken: 0)
+
+        let first = await engine.feed(transcript: "We need to make sales", at: clock.now)
+        #expect(first.position != nil)
+        #expect(first.position?.velocity ?? -1 == 0, "a fresh sample with no prior history must not invent velocity")
+
+        clock.set(2.0)
+        let second = await engine.feed(
+            transcript: "We need to make sales now and grow the business",
+            at: clock.now
+        )
+        #expect(second.position != nil)
+        #expect(second.position?.velocity ?? 0 > 0, "with elapsed time a second matched sample builds velocity")
+    }
+
+    @Test("TrackingEngine reports velocity once reading is underway, zero after a manual jump")
+    func engineVelocityLifecycle() async {
+        let clock = TestClock()
+        let engine = TrackingEngine(clock: { clock.now })
+        await engine.configure(script: await tokens())
+        await engine.start()
+        clock.set(0)
+        await engine.processASRResult(ASRResult(transcript: "We need to make sales"))
+        clock.set(2.0)
+        await engine.processASRResult(ASRResult(
+            transcript: "We need to make sales now and grow the business"
+        ))
+
+        var state = await engine.getCurrentState()
+        #expect(state.status == .tracking)
+        #expect(state.position.blockIndex == 0)
+        #expect(state.position.velocity > 0)
+
+        await engine.jumpTo(position: TrackingPosition(blockIndex: 1, wordIndex: 0))
+        state = await engine.getCurrentState()
+        #expect(state.position.velocity == 0, "a manual jump must snap, not glide at the old pace")
+    }
+}

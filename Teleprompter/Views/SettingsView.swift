@@ -136,9 +136,9 @@ struct KeyboardShortcutsView: View {
                 shortcutRow("Shift + ↑ / ↓", "Large adjustment")
             }
 
-            Section("Recording") {
-                shortcutRow("Cmd + Enter", "Start Recording")
-                shortcutRow("Esc", "Stop Recording")
+            Section("Appearance") {
+                shortcutRow("Cmd + = / -", "Increase / decrease font size")
+                shortcutRow("Cmd + 0", "Reset font size")
             }
         }
         .padding(20)

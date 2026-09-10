@@ -64,3 +64,12 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: $(BUILT_PRODUCTS_DIR)/Teleprompter.app/Contents/MacOS/Teleprompter
         BUNDLE_LOADER: $(TEST_HOST)
+
+schemes:
+  Teleprompter:
+    build:
+      targets:
+        Teleprompter: all
+    test:
+      targets:
+        - TeleprompterTests

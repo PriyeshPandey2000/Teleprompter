@@ -114,7 +114,7 @@ public actor TrackingEngine {
         if let latencyCycle {
             await latencyRecorder.mark(.matcherStarted, forCycle: latencyCycle)
         }
-        let outcome = await positionEngine.feed(transcript: result.transcript)
+        let outcome = await positionEngine.feed(transcript: result.transcript, at: clock())
         if let latencyCycle {
             await latencyRecorder.mark(.matcherFinished, forCycle: latencyCycle)
         }

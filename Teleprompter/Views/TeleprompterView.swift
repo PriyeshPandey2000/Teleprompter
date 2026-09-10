@@ -73,16 +73,33 @@ struct TeleprompterView: View {
                 .padding(.vertical, 80)
             }
             .onAppear { scrollProxy = proxy }
-            .onChange(of: appState.trackingPosition.blockIndex) { _, newIndex in
-                scrollTo(block: newIndex, using: proxy)
+            .onChange(of: appState.trackingPosition.blockIndex) { oldIndex, newIndex in
+                scrollTo(block: newIndex, from: oldIndex, using: proxy)
             }
         }
     }
 
-    private func scrollTo(block index: Int, using proxy: ScrollViewProxy) {
-        withAnimation(.easeInOut(duration: 0.15)) {
+    /// Moves the script so `index` sits at the center of the viewport,
+    /// gliding at the reader's measured pace instead of snapping. Duration
+    /// scales inversely with reading velocity (`ScrollTiming`), so a fast
+    /// speaker scrolls briskly and a slow reader gets a gentle, long glide —
+    /// never a 0.15s teleport on a big move.
+    private func scrollTo(block index: Int, from oldIndex: Int, using proxy: ScrollViewProxy) {
+        let words = wordsBetween(oldIndex, index)
+        let duration = ScrollTiming.travelDuration(words: words, velocity: appState.trackingPosition.velocity)
+        withAnimation(.easeOut(duration: duration)) {
             proxy.scrollTo("block-\(index)", anchor: .center)
         }
+    }
+
+    /// Word distance between two block starts, in the matcher's flat token
+    /// space. Used to size the scroll glide to the reader's reading speed.
+    private func wordsBetween(_ a: Int, _ b: Int) -> Int {
+        guard let ta = formattedScript.tokens.tokenIndex(block: a, word: 0),
+              let tb = formattedScript.tokens.tokenIndex(block: b, word: 0) else {
+            return 0
+        }
+        return abs(tb - ta)
     }
 
     /// Opacity for text that's behind the reader's current position — dimmed
@@ -218,12 +235,30 @@ struct TeleprompterView: View {
     // MARK: - Keyboard
 
     private func handleKeyPress(_ event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command) {
+            switch event.charactersIgnoringModifiers?.lowercased() {
+            case "=", "+":
+                fontSize = min(72, fontSize + 2)
+                return true
+            case "-", "_":
+                fontSize = max(20, fontSize - 2)
+                return true
+            case "0":
+                fontSize = AppState.autoFontSize()
+                return true
+            default:
+                break
+            }
+        }
+
+        let largeStep = 5
+        let isLarge = event.modifierFlags.contains(.shift)
         switch event.keyCode {
         case 126: // Up arrow
-            Task { await appState.adjustPosition(delta: -1) }
+            Task { await appState.adjustPosition(delta: isLarge ? -largeStep : -1) }
             return true
         case 125: // Down arrow
-            Task { await appState.adjustPosition(delta: 1) }
+            Task { await appState.adjustPosition(delta: isLarge ? largeStep : 1) }
             return true
         case 49: // Space — pause/resume
             Task {
