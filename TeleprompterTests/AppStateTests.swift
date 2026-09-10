@@ -151,6 +151,33 @@ struct AppStateTests {
         #expect(session.endTime != nil)
         #expect(!session.events.isEmpty, "position/status events from the take should be recorded")
     }
+
+    @Test("Recording telemetry stamps Gate-1 latency once results flow")
+    func telemetryStampsGate1Latency() async throws {
+        let mock = MockSpeechRecognizer()
+        let appState = AppState(recognizer: mock)
+        await appState.loadScript(rawText: "We need to make sales now and grow the business.\n\nSales are up.")
+
+        await appState.startRecording()
+
+        // Word-by-word partials so each result advances the cursor and lands
+        // a UI position update (each becomes one latency cycle).
+        let full = "We need to make sales now and grow the business"
+        var partial = ""
+        for word in full.split(separator: " ") {
+            partial = partial.isEmpty ? String(word) : "\(partial) \(word)"
+            mock.onResult?(ASRResult(transcript: partial, isFinal: false, confidence: 0.9))
+            try await Task.sleep(for: .milliseconds(15))
+        }
+        await appState.stopRecording()
+
+        let scriptID = try #require(appState.currentScript?.id)
+        let session = try #require(await appState.telemetry.getSessions(for: scriptID).first)
+
+        #expect(session.trackingLatencyMean != nil, "a take with tracked speech must stamp a latency mean")
+        #expect(session.trackingLatencyP95 != nil, "a take with tracked speech must stamp a latency p95")
+        #expect((session.trackingLatencyP95 ?? 0) <= 0.2, "Gate 1: p95 total latency must stay under 200ms")
+    }
 }
 
 // MARK: - Script Loading

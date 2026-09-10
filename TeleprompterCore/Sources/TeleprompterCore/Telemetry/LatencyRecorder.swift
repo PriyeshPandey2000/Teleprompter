@@ -18,6 +18,7 @@ public struct LatencyMarkName: Sendable, Equatable, Hashable {
 /// Per-segment timing deltas for a single update cycle.
 public struct LatencySample: Sendable, Equatable {
     public let cycleID: UInt64
+    public let asrReceivedAt: TimeInterval?
     public let asrToMatcher: TimeInterval?
     public let matcherDuration: TimeInterval?
     public let matcherToEmit: TimeInterval?
@@ -26,6 +27,7 @@ public struct LatencySample: Sendable, Equatable {
 
     public init(
         cycleID: UInt64,
+        asrReceivedAt: TimeInterval? = nil,
         asrToMatcher: TimeInterval? = nil,
         matcherDuration: TimeInterval? = nil,
         matcherToEmit: TimeInterval? = nil,
@@ -33,6 +35,7 @@ public struct LatencySample: Sendable, Equatable {
         total: TimeInterval? = nil
     ) {
         self.cycleID = cycleID
+        self.asrReceivedAt = asrReceivedAt
         self.asrToMatcher = asrToMatcher
         self.matcherDuration = matcherDuration
         self.matcherToEmit = matcherToEmit
@@ -81,6 +84,7 @@ public struct DistributionStats: Sendable, Equatable {
 /// Rolling latency summary across update cycles.
 public struct LatencySummary: Sendable, Equatable {
     public let completedCycles: Int
+    public let asrCadence: DistributionStats?
     public let asrToMatcher: DistributionStats?
     public let matcherDuration: DistributionStats?
     public let matcherToEmit: DistributionStats?
@@ -89,6 +93,7 @@ public struct LatencySummary: Sendable, Equatable {
 
     public init(
         completedCycles: Int,
+        asrCadence: DistributionStats? = nil,
         asrToMatcher: DistributionStats? = nil,
         matcherDuration: DistributionStats? = nil,
         matcherToEmit: DistributionStats? = nil,
@@ -96,6 +101,7 @@ public struct LatencySummary: Sendable, Equatable {
         total: DistributionStats? = nil
     ) {
         self.completedCycles = completedCycles
+        self.asrCadence = asrCadence
         self.asrToMatcher = asrToMatcher
         self.matcherDuration = matcherDuration
         self.matcherToEmit = matcherToEmit
@@ -159,6 +165,7 @@ public actor LatencyRecorder {
 
         let sample = LatencySample(
             cycleID: id,
+            asrReceivedAt: asr,
             asrToMatcher: asr != nil && matcherStart != nil ? matcherStart! - asr! : nil,
             matcherDuration: matcherStart != nil && matcherFinish != nil ? matcherFinish! - matcherStart! : nil,
             matcherToEmit: matcherFinish != nil && emit != nil ? emit! - matcherFinish! : nil,
@@ -177,8 +184,14 @@ public actor LatencyRecorder {
     }
 
     public func summary() -> LatencySummary {
-        LatencySummary(
+        let arrivals = samples.compactMap(\.asrReceivedAt)
+        return LatencySummary(
             completedCycles: samples.count,
+            // Gap between consecutive ASR partial arrivals — this is how often
+            // new transcript text (and therefore a new highlight step) can
+            // possibly happen. The dominant part of *perceived* response for
+            // a live reader, entirely owned by the Speech framework, not us.
+            asrCadence: DistributionStats.make(zip(arrivals.dropFirst(), arrivals).map { $0 - $1 }),
             asrToMatcher: DistributionStats.make(samples.compactMap(\.asrToMatcher)),
             matcherDuration: DistributionStats.make(samples.compactMap(\.matcherDuration)),
             matcherToEmit: DistributionStats.make(samples.compactMap(\.matcherToEmit)),

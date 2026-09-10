@@ -16,9 +16,13 @@ public actor RecordingTelemetry {
         currentSession?.record(event)
     }
 
-    public func endSession() -> RecordingSession? {
+    public func endSession(latency: LatencySummary? = nil) -> RecordingSession? {
         guard var session = currentSession else { return nil }
-        session.finish()
+        if let latency {
+            session.finish(latency: latency)
+        } else {
+            session.finish()
+        }
         sessions.append(session)
         currentSession = nil
         return session
