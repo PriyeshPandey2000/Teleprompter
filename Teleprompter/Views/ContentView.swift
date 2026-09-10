@@ -104,7 +104,7 @@ struct SidebarView: View {
         case .paused: return .gray
         case .manual: return .blue
         case .uncertain, .recovering: return .yellow
-        case .degraded: return .red
+        case .degraded, .manualFallback: return .red
         }
     }
 
@@ -116,6 +116,7 @@ struct SidebarView: View {
         case .uncertain: return "Uncertain"
         case .recovering: return "Recovering"
         case .degraded: return "Degraded"
+        case .manualFallback: return "Paused — tap to resume"
         }
     }
 }

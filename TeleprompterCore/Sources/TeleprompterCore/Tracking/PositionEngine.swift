@@ -1,15 +1,17 @@
 import Foundation
 
 public actor PositionEngine {
-    private let maxCandidateHistory = 20
-
-    public struct MatchResult: Sendable {
-        public let position: TrackingPosition
+    public struct FeedOutcome: Sendable {
+        public let position: TrackingPosition?
         public let quality: MatchQuality
+        public let reanchored: Bool
+        public let missStreak: Int
 
-        public init(position: TrackingPosition, quality: MatchQuality) {
+        public init(position: TrackingPosition?, quality: MatchQuality, reanchored: Bool, missStreak: Int) {
             self.position = position
             self.quality = quality
+            self.reanchored = reanchored
+            self.missStreak = missStreak
         }
     }
 
@@ -20,123 +22,82 @@ public actor PositionEngine {
         case none
     }
 
-    public init() {}
+    private var script: ScriptTokens?
+    private var snapshot = MatcherSnapshot()
+    private var lastSpokenCount = 0
+    private let config: MatcherConfiguration
 
-    public func findBestMatch(
-        for transcript: String,
-        currentPosition: TrackingPosition,
-        history: [TrackingEvent]
-    ) async -> MatchResult {
-        let normalizedInput = normalizeText(transcript)
-        guard !normalizedInput.isEmpty else {
-            return MatchResult(position: currentPosition, quality: .none)
-        }
-
-        let nearbyBlocks = findNearbyBlocks(
-            matching: normalizedInput,
-            near: currentPosition,
-            searchRadius: 5
-        )
-
-        guard let bestCandidate = nearbyBlocks.first else {
-            return MatchResult(position: currentPosition, quality: .none)
-        }
-
-        let quality = assessQuality(
-            candidate: bestCandidate.position,
-            current: currentPosition,
-            similarity: bestCandidate.similarity,
-            history: history
-        )
-
-        return MatchResult(position: bestCandidate.position, quality: quality)
+    public init(config: MatcherConfiguration = .default) {
+        self.config = config
     }
 
-    public func smoothPosition(
-        current: TrackingPosition,
-        candidate: TrackingPosition,
-        velocity: Double
-    ) -> TrackingPosition {
-        let smoothingFactor = 0.6
-        let blockDiff = candidate.blockIndex - current.blockIndex
-
-        guard abs(blockDiff) <= 2 else {
-            return candidate
-        }
-
-        let smoothedBlock = Double(current.blockIndex) * (1 - smoothingFactor) + Double(candidate.blockIndex) * smoothingFactor
-        let smoothedWord = Double(current.wordIndex) * (1 - smoothingFactor) + Double(candidate.wordIndex) * smoothingFactor
-        let newVelocity = Double(blockDiff) * smoothingFactor + velocity * (1 - smoothingFactor)
-
-        return TrackingPosition(
-            blockIndex: Int(smoothedBlock.rounded()),
-            wordIndex: Int(smoothedWord.rounded()),
-            confidence: candidate.confidence,
-            velocity: newVelocity
-        )
+    /// Installs the token index for the current script and resets the cursor.
+    public func configure(script: ScriptTokens?) async {
+        self.script = script
+        snapshot = MatcherSnapshot()
+        lastSpokenCount = 0
     }
 
-    // MARK: - Private
+    /// Resets the matching cursor to a flat token index (used for manual jumps
+    /// and session starts), discarding any unconsumed spoken backlog so the
+    /// cursor stays put and old words are never replayed against the new spot.
+    public func reset(toToken token: Int) async {
+        snapshot = MatcherSnapshot(cursor: max(0, token), consumedSpokenCount: lastSpokenCount)
+    }
 
-    private func findNearbyBlocks(
-        matching query: String,
-        near position: TrackingPosition,
-        searchRadius: Int
-    ) -> [(position: TrackingPosition, similarity: Double)] {
-        var results: [(position: TrackingPosition, similarity: Double)] = []
+    /// Feeds the latest ASR transcript and resolves the matching outcome.
+    public func feed(transcript: String) -> FeedOutcome {
+        guard let script else {
+            return FeedOutcome(position: nil, quality: .none, reanchored: false, missStreak: 0)
+        }
 
-        let startBlock = max(0, position.blockIndex - searchRadius)
-        let endBlock = position.blockIndex + searchRadius
+        let spoken = ScriptMatcher.tokenizeSpoken(transcript, config: config)
+        lastSpokenCount = spoken.count
+        let (newSnapshot, result) = ScriptMatcher.advance(
+            snapshot: snapshot,
+            script: script,
+            spoken: spoken,
+            config: config
+        )
+        snapshot = newSnapshot
 
-        for blockIndex in startBlock...endBlock {
-            let similarity = calculateSimilarity(query, blockIndex: blockIndex)
-            if similarity > 0.3 {
-                let pos = TrackingPosition(
-                    blockIndex: blockIndex,
-                    wordIndex: 0,
-                    confidence: similarity
-                )
-                results.append((position: pos, similarity: similarity))
+        switch result.kind {
+        case .near, .reanchor:
+            guard let cursor = result.cursor else {
+                return FeedOutcome(position: nil, quality: .none, reanchored: false, missStreak: result.missStreak)
             }
-        }
+            let position = position(forToken: cursor - 1, confidence: 0.95)
+            return FeedOutcome(
+                position: position,
+                quality: .high,
+                reanchored: result.kind == .reanchor,
+                missStreak: result.missStreak
+            )
 
-        return results.sorted { $0.similarity > $1.similarity }
+        case .far:
+            guard let cursor = result.cursor else {
+                return FeedOutcome(position: nil, quality: .none, reanchored: false, missStreak: result.missStreak)
+            }
+            let position = position(forToken: cursor - 1, confidence: 0.8)
+            return FeedOutcome(position: position, quality: .high, reanchored: false, missStreak: result.missStreak)
+
+        case .hold:
+            // Aligned and idle (missStreak == 0) or mid-miss-run: the engine decides.
+            return FeedOutcome(
+                position: nil,
+                quality: .none,
+                reanchored: false,
+                missStreak: result.missStreak
+            )
+
+        case .rebased:
+            return FeedOutcome(position: nil, quality: .none, reanchored: false, missStreak: result.missStreak)
+        }
     }
 
-    private func calculateSimilarity(_ query: String, blockIndex: Int) -> Double {
-        let words = query.split(separator: " ")
-        guard !words.isEmpty else { return 0 }
-
-        let matchCount = words.prefix(5).enumerated().filter { index, word in
-            index < 5
-        }.count
-
-        return Double(matchCount) / Double(min(words.count, 5))
-    }
-
-    private func assessQuality(
-        candidate: TrackingPosition,
-        current: TrackingPosition,
-        similarity: Double,
-        history: [TrackingEvent]
-    ) -> MatchQuality {
-        let blockDelta = abs(candidate.blockIndex - current.blockIndex)
-
-        if similarity > 0.8 && blockDelta <= 1 {
-            return .high
-        }
-        if similarity > 0.5 && blockDelta <= 3 {
-            return .medium
-        }
-        if similarity > 0.3 && blockDelta <= 5 {
-            return .low
-        }
-        return .none
-    }
-
-    private func normalizeText(_ text: String) -> String {
-        text.lowercased()
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+    private func position(forToken token: Int, confidence: Double) -> TrackingPosition? {
+        guard let script, let block = script.blockIndex(forToken: token) else { return nil }
+        let word = script.wordIndex(forToken: token, inBlock: block)
+        return TrackingPosition(blockIndex: block, wordIndex: word, confidence: confidence)
     }
 }

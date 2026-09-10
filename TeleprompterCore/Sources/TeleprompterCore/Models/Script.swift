@@ -28,6 +28,8 @@ public struct FormattedScript: Sendable {
     public let plainText: String
     public let wordCount: Int
     public let estimatedDuration: TimeInterval
+    /// Flat, per-block token index used by the position matcher.
+    public let tokens: ScriptTokens
 }
 
 public enum ScriptBlock: Sendable, Identifiable {

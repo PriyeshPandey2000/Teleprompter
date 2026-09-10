@@ -7,7 +7,7 @@ public actor RecoveryManager {
     private let maxRecoveryAttempts = 3
     private let failureThreshold = 3
 
-    public enum RecoveryAction: Sendable {
+    public enum RecoveryAction: Sendable, Equatable {
         case none
         case holdPosition
         case suggestManualCorrection
